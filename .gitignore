@@ -1,0 +1,18 @@
+# Terraform
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+terraform/build/
+crash.log
+*.tfvars
+!example.tfvars
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# Generated data (recreate with data/generate_raw_data.py)
+raw_energy_readings.csv
