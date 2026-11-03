@@ -75,3 +75,35 @@ def test_full_generated_dataset(tmp_path):
     assert q["rows_out"] == len(out) == 6840
     assert q["pass_rate_pct"] == pytest.approx(92.23)
     assert out["energy_kwh"].between(0, 500).all()
+
+
+def test_missing_text_stays_missing_instead_of_becoming_nan():
+    out, q = transform(frame(good("R1", status=None), good("R2")))
+    assert q["null_status"] == 1
+    assert q["unknown_status_values"] == []          # not ["nan"]
+    assert out["status"].isna().sum() == 1
+
+
+def test_missing_or_unknown_unit_is_rejected_not_assumed_kwh():
+    out, q = transform(frame(good("R1", energy_unit=None), good("R2", energy_unit="MWh"), good("R3")))
+    assert list(out["reading_id"]) == ["R3"]
+    assert q["unknown_unit_rejected"] == 2
+
+
+def test_handler_processes_every_file_in_the_event(monkeypatch):
+    import types
+    written, reports = [], []
+    wr = types.SimpleNamespace(s3=types.SimpleNamespace(
+        read_csv=lambda path, dtype: frame(good("R1"), good("R2")),
+        to_parquet=lambda **kw: written.append(len(kw["df"]))))
+    client = types.SimpleNamespace(put_object=lambda **kw: reports.append(kw["Key"]))
+    boto3 = types.SimpleNamespace(client=lambda name: client)
+    monkeypatch.setitem(sys.modules, "awswrangler", wr)
+    monkeypatch.setitem(sys.modules, "boto3", boto3)
+    monkeypatch.setenv("CURATED_BUCKET", "curated")
+    from transform import handler
+
+    event = {"Records": [{"s3": {"bucket": {"name": "raw"}, "object": {"key": f"raw/day{i}.csv"}}} for i in (1, 2)]}
+    result = handler(event, None)
+    assert result["files"] == 2 and written == [2, 2]
+    assert len(set(reports)) == 2 and all(k.endswith(("_day1.json", "_day2.json")) for k in reports)
