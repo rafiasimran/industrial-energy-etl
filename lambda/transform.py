@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 import pandas as pd
 
 VALID_STATUSES = {"running", "idle", "maintenance"}
+ENERGY_UNITS = {"kwh", "wh"}
 MAX_PLAUSIBLE_TEMP_C = 200.0
 MAX_PLAUSIBLE_KWH = 500.0
 TIMESTAMP_FORMATS = ("%Y-%m-%d %H:%M:%S", "%d/%m/%Y %H:%M", "%Y-%m-%dT%H:%M:%S")
@@ -39,9 +40,10 @@ def transform(df: pd.DataFrame):
     df = df.drop_duplicates(subset=["reading_id"], keep="first").copy()
     quality["duplicates_removed"] = before - len(df)
 
-    # 2. Normalise text before anything groups on it.
+    # 2. Normalise text before anything groups on it. The "string" type keeps
+    #    missing values missing; astype(str) would turn them into the text "nan".
     for col in ("status", "plant", "machine_id", "energy_unit"):
-        df[col] = df[col].astype(str).str.strip().str.lower()
+        df[col] = df[col].astype("string").str.strip().str.lower()
     df["plant"] = df["plant"].str.title()
     df["machine_id"] = df["machine_id"].str.upper()
 
@@ -50,6 +52,10 @@ def transform(df: pd.DataFrame):
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
     # 4. Harmonise units. Wh and kWh in one column is a silent 1000x error.
+    #    A missing or unknown unit is rejected rather than assumed to be kWh.
+    known_unit = df["energy_unit"].isin(ENERGY_UNITS).fillna(False).astype(bool)
+    quality["unknown_unit_rejected"] = int((~known_unit).sum())
+    df = df[known_unit].copy()
     is_wh = df["energy_unit"] == "wh"
     df["energy_kwh"] = df["energy"].where(~is_wh, df["energy"] / 1000)
     quality["rows_converted_from_wh"] = int(is_wh.sum())
@@ -76,8 +82,9 @@ def transform(df: pd.DataFrame):
     quality["null_voltage"] = int(df["voltage_v"].isna().sum())
     quality["null_temperature"] = int(df["temperature_c"].isna().sum())
 
-    # 9. Unexpected status values get flagged rather than silently accepted.
-    quality["unknown_status_values"] = sorted(set(df["status"].unique()) - VALID_STATUSES)
+    # 9. Unexpected or missing status values get flagged rather than silently accepted.
+    quality["null_status"] = int(df["status"].isna().sum())
+    quality["unknown_status_values"] = sorted(set(df["status"].dropna().unique()) - VALID_STATUSES)
 
     # 10. Derived columns the analysts will ask for anyway.
     df["reading_hour"] = df["reading_ts"].dt.hour.astype("int32")
@@ -104,34 +111,41 @@ def handler(event, context):
     curated_bucket = os.environ["CURATED_BUCKET"]
     curated_prefix = os.environ.get("CURATED_PREFIX", "readings")
     quality_prefix = os.environ.get("QUALITY_PREFIX", "quality-reports")
+    s3 = boto3.client("s3")
 
-    record = event["Records"][0]["s3"]
-    bucket = record["bucket"]["name"]
-    key = urllib.parse.unquote_plus(record["object"]["key"])
-    source = f"s3://{bucket}/{key}"
-    print(f"Reading {source}")
+    # One S3 event can carry several files, so handle every record, not just the first.
+    reports = []
+    for record in event["Records"]:
+        bucket = record["s3"]["bucket"]["name"]
+        key = urllib.parse.unquote_plus(record["s3"]["object"]["key"])
+        source = f"s3://{bucket}/{key}"
+        print(f"Reading {source}")
 
-    df = wr.s3.read_csv(source, dtype=str)
-    clean, quality = transform(df)
+        df = wr.s3.read_csv(source, dtype=str)
+        clean, quality = transform(df)
 
-    wr.s3.to_parquet(
-        df=clean,
-        path=f"s3://{curated_bucket}/{curated_prefix}/",
-        dataset=True,
-        partition_cols=["reading_date"],
-        mode="overwrite_partitions",
-        compression="snappy",
-    )
+        wr.s3.to_parquet(
+            df=clean,
+            path=f"s3://{curated_bucket}/{curated_prefix}/",
+            dataset=True,
+            partition_cols=["reading_date"],
+            mode="overwrite_partitions",
+            compression="snappy",
+        )
 
-    quality["source_file"] = source
-    quality["processed_at_utc"] = datetime.now(timezone.utc).isoformat()
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    boto3.client("s3").put_object(
-        Bucket=curated_bucket,
-        Key=f"{quality_prefix}/quality_{stamp}.json",
-        Body=json.dumps(quality, indent=2).encode("utf-8"),
-        ContentType="application/json",
-    )
+        quality["source_file"] = source
+        quality["processed_at_utc"] = datetime.now(timezone.utc).isoformat()
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        # The file name is part of the key, so two files processed in the same
+        # second don't overwrite each other's report.
+        name = key.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+        s3.put_object(
+            Bucket=curated_bucket,
+            Key=f"{quality_prefix}/quality_{stamp}_{name}.json",
+            Body=json.dumps(quality, indent=2).encode("utf-8"),
+            ContentType="application/json",
+        )
+        print(json.dumps(quality, indent=2))
+        reports.append(quality)
 
-    print(json.dumps(quality, indent=2))
-    return {"status": "ok", "quality": quality}
+    return {"status": "ok", "files": len(reports), "quality": reports}
