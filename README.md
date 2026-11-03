@@ -94,6 +94,12 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
+## Known limitations
+
+- The data is synthetic. The cleaning rules come from problems real plant exports have, but they haven't met a real export yet.
+- Each upload replaces the days it contains in the curated zone. Uploading the same file twice is safe, but if two different files cover the same day, the later one replaces the earlier one's rows for that day. That fits one export per day or per month, not several partial files per day.
+- Timestamps in `dd/mm/yyyy` form are read as European dates; a US-style export would need its own format added.
+
 ## Deploying
 
 Step by step in [docs/RUNBOOK.md](docs/RUNBOOK.md). Short version:
